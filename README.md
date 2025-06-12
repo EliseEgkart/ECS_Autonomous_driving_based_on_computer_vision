@@ -1,10 +1,15 @@
-# 임베디드 통신시스템 프로젝트 - ~~
+# 임베디드 통신시스템 프로젝트 - 라인 인식(Cam)기반 자율주행 프로젝트트
 
 ## 팀 구성원 및 역할분담
 | 이름 | 담당 업무 |
 |------|-----------|
 | **김형진** | 라즈베리파이 : 영상 처리, 라인 검출기반 조향 제어 |
 | **김수민** | 아두이노 : RC 신호 해석, 서보모터 · ESC 제어 로직 |
+
+---
+## 프로젝트 개요
+본 프로젝트는 Raspberry Pi와 Arduino를 이용해 라인 인식 기반 자율주행 RC카를 구현한 임베디드 통신시스템 프로젝트입니다.  
+카메라 기반 영상 처리와 PID 알고리즘을 통해 차선을 추종하며 주행하며, RC 조종기 또는 자동 제어로 전환 가능한 이중 제어 시스템을 구성합니다.
 
 ---
 
@@ -22,493 +27,164 @@
 ![실제 RC Car 사진](image/Car_side_image.png)
 다음은 실제 구동하는 RC Car 사진입니다. 위쪽 면, 우측 면, 좌측 면에 해당하는 사진입니다.
 
-## 개요
+-------------------------------------------------------------------------------------------
+
+## 소스 동작원리 - ECS_Project_Arduino_manual.ino
+이 코드는 RC 조종기의 PWM 신호를 실시간으로 수신하여 **직진/후진용 ESC**와 **조향용 서보모터**를 제어하고, **방향지시등 LED를 자동 점멸**하는 시스템입니다.
+
+### 전체 구조 요약
+
+| 기능             | 설명 |
+|------------------|------|
+| **PWM 입력**     | RC 수신기에서 CH2(직진/후진), CH1(조향) PWM 수신 |
+| **PWM 디코딩**   | `PinChangeInterrupt` 라이브러리로 마이크로초 단위 펄스폭 측정 |
+| **PWM 출력**     | `Servo` 라이브러리 사용 – ESC와 조향 서보 제어 |
+| **상태 판단**    | 입력 PWM을 기반으로 주행 상태(`drive_state`) 계산 |
+| **LED 제어**     | 주행 상태에 따라 좌우 방향지시등 점멸 또는 상시 점등 |
 
 ---
 
-## 소스 동작원리 - ECS_Project_Arduino_manual
-### 전체 로직 설명
+### 동작 흐름 요약
 
-이 아두이노 코드는 **RC 수신기**로부터 PWM 신호를 직접 받아 ESC(직진/후진)과 서보모터(조향)를 제어하는 **수동 주행 전용 프로그램**입니다.
+#### 1. 핀 및 초기값 정의
 
-- **CH2 (A0 핀)**: 직진/후진을 위한 PWM 입력 (스틱 위아래)
-- **CH1 (A1 핀)**: 조향(좌/우)을 위한 PWM 입력 (스틱 좌우)
-- **LED (7, 8번 핀)**: 방향지시등 표시
-- **제어 주기**: 약 20ms 간격으로 PWM 신호를 판독하고 주행 상태를 판단함
-- **핵심 기능**:
-  - `PinChangeInterrupt`로 PWM 신호 폭 측정
-  - `straight_Control()`과 `direct_Control()`로 제어
-  - `drive_state`에 따라 LED 점등/점멸
-  - PWM 데드존 및 오프셋 적용하여 안전한 제어
+- `A0`, `A1` → RC PWM 입력 (CH2, CH1)
+- `7`, `8` → 방향지시등 (좌/우)
+- `9`, `10` → 제어 출력 핀 (ESC, 서보)
+- `PWM_MID` 기준으로 정지/전진/후진 판별
 
-### 코드 전체 및 상세 주석
+#### 2. 인터럽트 기반 PWM 측정
+
+- `PinChangeInterrupt` 라이브러리를 사용하여 핀의 HIGH/LOW 변화를 감지
+- 상승엣지 시간 `micros()`로 기록, 하강엣지에서 폭 계산
 
 ```cpp
-#include <Arduino.h>
-#include "PinChangeInterrupt.h"
-#include "Servo.h"
+if (digitalRead(pinRC2_straight) == HIGH)
+    uRC2StartHigh = micros(); // 상승엣지
+else
+    nRC2PulseWidth = micros() - uRC2StartHigh;
+```
 
-// --- PWM 입력 핀 정의 (RC 수신기 연결)
-#define pinRC2_straight       A0   // CH2: 직진/후진
-#define pinRC1_direct         A1   // CH1: 좌/우 조향
+#### 3. PWM 해석 및 제어
+- 데드존 ±20 µs 내에서는 정지
+- 전진/후진 기준값은 PWM_STRAIGHT_FRONT, PWM_STRAIGHT_BACK
+- PWM_VARIATION만큼 조정
+```cpp
+if (selected_pwm > PWM_MID + DEADZONE)
+    straight_pwm = PWM_STRAIGHT_FRONT + PWM_VARIATION;
+```
+- 조향은 그대로 서보에 전달 (다만 보정값 -157 적용)
+```cpp
+direct_pwm = nRC1PulseWidth - 157;
+direct_motor.writeMicroseconds(direct_pwm);
+```
+#### 4. 주행 상태 판단 및 LED 제어
 
-// --- 방향지시등 LED 핀 정의
-#define LEFT_LED_PIN          7
-#define RIGHT_LED_PIN         8
+- `drive_state`는 아래 기준으로 설정됨:
 
-// --- 제어 출력 핀 (서보모터, ESC)
-#define control_straight_pin  9    // 직진/후진 ESC
-#define control_direct_pin    10   // 조향 서보
+| 상태코드 | 의미     | 조건                           |
+|----------|----------|--------------------------------|
+| 0        | 후진     | CH2 < PWM_MID - PWM_DEADZONE   |
+| 1        | 좌회전   | CH1 < PWM_MID - LR_SEPARATION  |
+| 2        | 우회전   | CH1 > PWM_MID + LR_SEPARATION  |
+| 3        | 전진     | CH2 > PWM_MID + PWM_DEADZONE   |
 
-// --- PWM 신호 기준값 (µs 단위)
-#define PWM_MIN               1068
-#define PWM_MID               1492  // 중립값 (약 1500)
-#define PWM_MAX               1932
+- LED 출력 방식:
 
-// --- 데드존 설정 (정지 상태 허용범위)
-#define PWM_DEADZONE          20    // ±20 µs 내에서는 정지로 판단
+| 상태       | 좌측 LED | 우측 LED | 설명                      |
+|------------|----------|----------|---------------------------|
+| 전진       | OFF      | OFF      | 방향지시등 끔             |
+| 좌회전     | 깜빡임   | OFF      | 좌측 깜빡이 동작          |
+| 우회전     | OFF      | 깜빡임   | 우측 깜빡이 동작          |
+| 후진       | ON       | ON       | 양쪽 방향지시등 상시 점등 |
 
-// --- 전진/후진 기준 PWM
-#define PWM_STRAIGHT_FRONT    1535
-#define PWM_STRAIGHT_BACK     1445
-#define PWM_VARIATION         22    // 전진·후진 시 증감값
+- 깜빡임 구현 방식:
+  - `millis()`를 이용한 소프트웨어 타이머 방식
+  - 200ms 주기로 ON/OFF 전환
 
-// --- 조향 LED 판단 기준
-#define LR_SEPARATION         150   // 중립에서 ±150 이상이면 방향 판단
-
-// --- RC 입력값 저장용 변수 (CH2)
-volatile int            nRC2PulseWidth = PWM_MID;
-volatile unsigned long  uRC2StartHigh  = 0;
-volatile boolean        bNewRC2Pulse   = false;
-
-// --- RC 입력값 저장용 변수 (CH1)
-volatile int            nRC1PulseWidth = PWM_MID;
-volatile unsigned long  uRC1StartHigh  = 0;
-volatile boolean        bNewRC1Pulse   = false;
-
-// --- 제어 대상 서보 객체
-Servo straight_motor;
-Servo direct_motor;
-
-// --- 최종 PWM 출력값
-unsigned long straight_pwm = PWM_MID;
-unsigned long direct_pwm   = PWM_MID;
-
-// --- 주행 상태 표시용 (LED 출력용)
-volatile int drive_state = 0; // 0: 후진, 1: 좌회전, 2: 우회전, 3: 전진
-
-// --- PWM 측정용 인터럽트 함수 (직진/후진 채널)
-void pwmRC2_Straight() {
-  if (digitalRead(pinRC2_straight) == HIGH) {
-    uRC2StartHigh = micros(); // 상승엣지 시간 기록
-  } else if (uRC2StartHigh && !bNewRC2Pulse) {
-    nRC2PulseWidth = (int)(micros() - uRC2StartHigh); // 펄스폭 계산
-    uRC2StartHigh  = 0;
-    bNewRC2Pulse   = true;
-  }
-}
-
-// --- PWM 측정용 인터럽트 함수 (조향 채널)
-void pwmRC1_Direct() {
-  if (digitalRead(pinRC1_direct) == HIGH) {
-    uRC1StartHigh = micros();
-  } else if (uRC1StartHigh && !bNewRC1Pulse) {
-    nRC1PulseWidth = (int)(micros() - uRC1StartHigh);
-    uRC1StartHigh  = 0;
-    bNewRC1Pulse   = true;
-  }
-}
-
-// --- 아두이노 기본 설정
-void setup() {
-  // 입력 핀 초기화
-  pinMode(pinRC2_straight, INPUT_PULLUP);
-  pinMode(pinRC1_direct,   INPUT_PULLUP);
-
-  // LED 핀 초기화
-  pinMode(LEFT_LED_PIN,   OUTPUT);
-  pinMode(RIGHT_LED_PIN,  OUTPUT);
-  digitalWrite(LEFT_LED_PIN,   LOW);
-  digitalWrite(RIGHT_LED_PIN,  LOW);
-
-  // 서보 핀 설정
-  straight_motor.attach(control_straight_pin);
-  direct_motor.attach(control_direct_pin);
-
-  // PWM 측정을 위한 인터럽트 등록
-  attachPCINT(digitalPinToPCINT(pinRC2_straight), pwmRC2_Straight, CHANGE);
-  attachPCINT(digitalPinToPCINT(pinRC1_direct),   pwmRC1_Direct,   CHANGE);
-
-  Serial.begin(9600); // 디버깅용 시리얼 통신
-}
-
-// --- 직진/후진 제어 함수
-void straight_Control() {
-  if (!bNewRC2Pulse) {
-    // 새 신호 없으면 중립값 유지
-    straight_motor.writeMicroseconds(PWM_MID);
-    return;
-  }
-  bNewRC2Pulse = false;
-
-  int selected_pwm = nRC2PulseWidth;
-
-  if((selected_pwm < PWM_MID + PWM_DEADZONE) &&
-     (selected_pwm > PWM_MID - PWM_DEADZONE)) {
-    straight_pwm = PWM_MID; // 정지 상태
-  }
-  else if(selected_pwm >= PWM_MID + PWM_DEADZONE) {
-    straight_pwm = PWM_STRAIGHT_FRONT + PWM_VARIATION; // 전진
-  }
-  else if(selected_pwm <= PWM_MID - PWM_DEADZONE){
-    straight_pwm = PWM_STRAIGHT_BACK - PWM_VARIATION;  // 후진
-  }
-
-  straight_motor.writeMicroseconds(straight_pwm);
-}
-
-// --- 조향 제어 함수
-void direct_Control() {
-  if (!bNewRC1Pulse) {
-    direct_motor.writeMicroseconds(PWM_MID - 157); // 중립 출력
-    return;
-  }
-  bNewRC1Pulse = false;
-
-  direct_pwm = nRC1PulseWidth - 157; // 보정값 적용
-  direct_motor.writeMicroseconds(direct_pwm);
-}
-
-// --- 주행 상태에 따라 방향지시등 출력
-void updateLEDs() {
-  static unsigned long ledTimer = 0;
-  static bool ledOn = false;
-
-  switch (drive_state) {
-    case 3: // 전진: 꺼짐
-      digitalWrite(LEFT_LED_PIN, LOW);
-      digitalWrite(RIGHT_LED_PIN, LOW);
-      break;
-
-    case 1: // 좌회전: 왼쪽 점멸
-      if (millis() - ledTimer >= 200) {
-        ledOn = !ledOn;
-        ledTimer = millis();
-      }
-      digitalWrite(LEFT_LED_PIN, ledOn ? HIGH : LOW);
-      digitalWrite(RIGHT_LED_PIN, LOW);
-      break;
-
-    case 2: // 우회전: 오른쪽 점멸
-      if (millis() - ledTimer >= 200) {
-        ledOn = !ledOn;
-        ledTimer = millis();
-      }
-      digitalWrite(LEFT_LED_PIN, LOW);
-      digitalWrite(RIGHT_LED_PIN, ledOn ? HIGH : LOW);
-      break;
-
-    case 0: // 후진: 양쪽 항상 켜짐
-      digitalWrite(LEFT_LED_PIN, HIGH);
-      digitalWrite(RIGHT_LED_PIN, HIGH);
-      break;
-
-    default: // 예외 처리
-      digitalWrite(LEFT_LED_PIN, LOW);
-      digitalWrite(RIGHT_LED_PIN, LOW);
-      break;
-  }
-}
-
-// --- 메인 루프
-void loop() {
-  static unsigned long lastControlMicros = 0;
-  unsigned long now = micros();
-
-  // 20ms 주기마다 제어 수행
-  if (now - lastControlMicros >= 20000) {
-    straight_Control();
-    direct_Control();
-    lastControlMicros = now;
-
-    // 주행 상태 판단
-    int straight_val = nRC2PulseWidth;
-    int direct_val   = nRC1PulseWidth;
-
-    if (straight_val < PWM_MID - PWM_DEADZONE) {
-      drive_state = 0; // 후진
-    }
-    else if (direct_val < PWM_MID - LR_SEPARATION) {
-      drive_state = 1; // 좌회전
-    }
-    else if (direct_val > PWM_MID + LR_SEPARATION) {
-      drive_state = 2; // 우회전
-    }
-    else if (straight_val > PWM_MID + PWM_DEADZONE) {
-      drive_state = 3; // 전진
-    }
-    else {
-      drive_state = 3; // 기본 전진
-    }
-
-    updateLEDs(); // 방향지시등 갱신
-  }
+```cpp
+if (millis() - ledTimer >= 200) {
+    ledOn = !ledOn;
+    ledTimer = millis();
 }
 ```
+-------------------------------------------------------------------------------------------
 
 ## 소스 동작원리 - ECS_Project_Arduino_Auto
-### 전체 로직 설명
-이 코드는 RC 수신기의 PWM 입력뿐만 아니라, **Raspberry Pi로부터 전달되는 직진/조향 제어 값**을 동시에 처리할 수 있는 **수동·자동 겸용 RC 제어 프로그램**입니다.  
-RC 송신기 CH9(스위치)를 통해 두 모드 간 전환이 가능합니다.
+이 코드는 RC 수신기의 PWM 신호뿐만 아니라 **Raspberry Pi로부터 UART로 수신되는 제어 명령**을 기반으로 하는 **자동/수동 겸용 제어 시스템**입니다.  
+RC 송신기의 CH9 스위치를 기준으로 두 모드 간 전환이 가능하며, 각각의 입력에 따라 **직진/조향 제어 및 방향지시등 동작을 구현**합니다.
 
-- **수동 모드** (CH9 < 1500µs): RC 송신기 CH1, CH2 입력값을 직접 서보 및 ESC에 전달
-- **자동 모드** (CH9 ≥ 1500µs): Raspberry Pi에서 UART로 전송된 `"직진PWM,조향PWM\n"` 값을 사용
-- **직진/후진**은 ESC (핀 9), **좌우 조향**은 서보모터 (핀 10)를 통해 제어
-- **LED**는 전진/후진/좌/우 상태에 따라 점등 또는 점멸
-### 코드 전체 및 상세 주석
+| 모드 구분      | 판단 기준           | 제어 입력 원천                 | 제어 대상                |
+|----------------|---------------------|-------------------------------|---------------------------|
+| **수동 모드**   | CH9 < 1500µs         | RC 송신기 CH1 (조향), CH2 (속도) | 직접 서보/ESC 제어       |
+| **자동 모드**   | CH9 ≥ 1500µs         | Raspberry Pi → Serial `"속도,조향"` | Pi로부터 전송된 제어값 사용 |
+
+### 기능별 구조 요약
+
+| 기능 구분     | 설명 |
+|---------------|------|
+| **PWM 입력**   | CH1(조향), CH2(속도), CH9(모드 전환) 입력 PWM 측정 (PinChangeInterrupt) |
+| **자동 제어 수신** | Raspberry Pi로부터 `"speed,steer\n"` 문자열을 수신하여 PWM 값 파싱 |
+| **직진/조향 제어** | 모드에 따라 입력 PWM 선택 → Servo 라이브러리로 서보/ESC 제어 |
+| **방향지시등** | 현재 주행 상태(`drive_state`)에 따라 LED 점등/점멸 패턴 구현 |
+| **Fail-safe** | Serial 수신이 0.5초 이상 없을 시 PWM을 기본값(1500)으로 복원 |
+
+### 제어 흐름 개요
+
+#### 1. 입력 PWM 처리
+- 각 채널마다 PinChange 인터럽트를 등록하여 펄스 폭을 측정
+- CH1: 좌우 조향, CH2: 직진/후진, CH9: 자동/수동 모드 전환
+
+#### 2. 자동 제어 입력 (Serial 통신)
+- Raspberry Pi로부터 `"1520,1465\n"` 형식의 문자열 수신
+- comma 기준으로 `auto_straight_pwm`, `auto_direct_pwm`으로 분리
+- 500ms 이상 수신 없을 경우 자동값을 기본값(1500)으로 복귀
+
+#### 3. PWM 제어
+- CH9 값이 기준(1500) 이상이면 자동 제어 사용
+- 수동이면 RC 송신기의 CH1, CH2에서 직접 받은 PWM 사용
+- 직진은 ESC에, 조향은 서보모터에 연결됨
+
+#### 4. 주행 상태 판단 및 방향지시등 출력
+
+| 상태       | 조건                                         | LED 동작                       |
+|------------|----------------------------------------------|--------------------------------|
+| 후진       | 직진 PWM < PWM_MID - DEADZONE               | 양쪽 LED 항상 ON              |
+| 좌회전     | 조향 PWM < PWM_MID - LR_SEPARATION          | 좌측 LED 깜빡임               |
+| 우회전     | 조향 PWM > PWM_MID + LR_SEPARATION          | 우측 LED 깜빡임               |
+| 전진       | 직진 PWM > PWM_MID + DEADZONE               | LED OFF                       |
+| 정지 또는 중립 | Deadzone 내 또는 예외 처리                  | LED OFF                       |
+
+- 깜빡임 구현은 `millis()` 기반 200ms 간격 ON/OFF 토글
+
+---
+
+### 메인 루프 흐름
+
+1. `processSerialInput()` 실행 → 자동 제어값 수신
+2. 최신 CH9 상태 갱신 (모드 전환 판단)
+3. 20ms마다:
+   - `straight_Control()` 호출 → 직진 PWM 결정
+   - `direct_Control()` 호출 → 조향 PWM 결정
+   - 현재 주행 상태(`drive_state`) 판단
+   - `updateLEDs()`로 방향지시등 상태 갱신
 
 ```cpp
-#include <Arduino.h>
-#include "PinChangeInterrupt.h"
-#include "Servo.h"
-
-// --- PWM 입력 핀 정의 --- (RC 수신기 입력 핀)
-#define pinRC2_straight       A0  // CH2: 직진/후진
-#define pinRC1_direct         A1  // CH1: 조향
-#define pinRC9_Auto           A2  // CH9: 자동/수동 모드 전환
-
-// --- LED 핀 정의 --- (방향지시용)
-#define LEFT_LED_PIN          7
-#define RIGHT_LED_PIN         8
-
-// --- 제어 핀 정의 --- (서보 및 ESC 제어)
-#define control_straight_pin  9   // ESC
-#define control_direct_pin    10  // 서보
-
-// --- PWM 기준값 --- (µs 단위)
-#define PWM_MIN               1068
-#define PWM_MID               1492
-#define PWM_MAX               1932
-
-#define PWM_DEADZONE          20
-#define PWM_STRAIGHT_FRONT    1535
-#define PWM_STRAIGHT_BACK     1445
-#define PWM_VARIATION         22
-
-// --- 조향 판단 기준값 --- (좌우 구분용 deadband)
-#define LR_SEPARATION         150
-
-// --- 수신한 PWM 펄스폭 저장용 변수들 (CH2, CH1, CH9)
-volatile int            nRC2PulseWidth = PWM_MID;
-volatile unsigned long  uRC2StartHigh  = 0;
-volatile boolean        bNewRC2Pulse   = false;
-
-volatile int            nRC1PulseWidth = PWM_MID;
-volatile unsigned long  uRC1StartHigh  = 0;
-volatile boolean        bNewRC1Pulse   = false;
-
-volatile int            nRC9PulseWidth = PWM_MID;
-volatile unsigned long  uRC9StartHigh  = 0;
-volatile boolean        bNewRC9Pulse   = false;
-
-// --- 제어용 서보 객체
-Servo straight_motor;
-Servo direct_motor;
-
-// --- PWM 최종 출력값
-unsigned long straight_pwm = PWM_MID;
-unsigned long direct_pwm   = PWM_MID;
-
-// --- Pi에서 수신한 자동 제어용 PWM 값
-volatile int auto_straight_pwm = 1500;
-volatile int auto_direct_pwm   = 1500;
-
-// --- 주행 상태 (LED 패턴용)
-volatile int drive_state = 0; // 0:후진, 1:좌, 2:우, 3:전진
-
-// --- 인터럽트 핸들러: CH2 (직진/후진)
-void pwmRC2_Straight() {
-  if (digitalRead(pinRC2_straight) == HIGH) {
-    uRC2StartHigh = micros();
-  } else if (uRC2StartHigh && !bNewRC2Pulse) {
-    nRC2PulseWidth = (int)(micros() - uRC2StartHigh);
-    uRC2StartHigh  = 0;
-    bNewRC2Pulse   = true;
-  }
-}
-
-// --- 인터럽트 핸들러: CH1 (조향)
-void pwmRC1_Direct() {
-  if (digitalRead(pinRC1_direct) == HIGH) {
-    uRC1StartHigh = micros();
-  } else if (uRC1StartHigh && !bNewRC1Pulse) {
-    nRC1PulseWidth = (int)(micros() - uRC1StartHigh);
-    uRC1StartHigh  = 0;
-    bNewRC1Pulse   = true;
-  }
-}
-
-// --- 인터럽트 핸들러: CH9 (자동/수동 스위치)
-void pwmRC9_Auto() {
-  if (digitalRead(pinRC9_Auto) == HIGH) {
-    uRC9StartHigh = micros();
-  } else if (uRC9StartHigh && !bNewRC9Pulse) {
-    nRC9PulseWidth = (int)(micros() - uRC9StartHigh);
-    uRC9StartHigh  = 0;
-    bNewRC9Pulse   = true;
-  }
-}
-
-// --- 직진/후진 제어 함수
-void straight_Control() {
-  if (!bNewRC2Pulse) {
-    straight_motor.writeMicroseconds(PWM_MID);
-    return;
-  }
-  bNewRC2Pulse = false;
-
-  // CH9 값에 따라 수동 또는 자동 PWM 선택
-  int selected_pwm = (nRC9PulseWidth >= 1500) ? auto_straight_pwm : nRC2PulseWidth;
-
-  // 데드존 내 정지
-  if ((selected_pwm < PWM_MID + PWM_DEADZONE) && (selected_pwm > PWM_MID - PWM_DEADZONE)) {
-    straight_pwm = PWM_MID;
-  }
-  else if (selected_pwm >= PWM_MID + PWM_DEADZONE) {
-    straight_pwm = PWM_STRAIGHT_FRONT + PWM_VARIATION; // 전진
-  }
-  else if (selected_pwm <= PWM_MID - PWM_DEADZONE) {
-    straight_pwm = PWM_STRAIGHT_BACK - PWM_VARIATION;  // 후진
-  }
-
-  straight_motor.writeMicroseconds(straight_pwm);
-}
-
-// --- 조향 제어 함수
-void direct_Control() {
-  if (!bNewRC1Pulse) {
-    direct_motor.writeMicroseconds(PWM_MID - 157); // 중립값 출력
-    return;
-  }
-  bNewRC1Pulse = false;
-
-  // 자동 모드일 경우 보정값 적용
-  if (nRC9PulseWidth >= 1500)
-    direct_pwm = auto_direct_pwm - 165;
-  else
-    direct_pwm = nRC1PulseWidth - 157;
-
-  direct_motor.writeMicroseconds(direct_pwm);
-}
-
-// --- 시리얼 입력 처리 함수 (Pi로부터 수신)
-void processSerialInput() {
-  static String inputString = "";
-  static unsigned long lastSerialTime = 0;
-  const unsigned long serialTimeout = 500; // 500ms 이상 무응답 시 fail-safe
-
-  while (Serial.available()) {
-    char inChar = (char)Serial.read();
-    lastSerialTime = millis();
-    if (inChar == '\n') {
-      int commaIndex = inputString.indexOf(',');
-      if (commaIndex > 0) {
-        auto_straight_pwm = inputString.substring(0, commaIndex).toInt();
-        auto_direct_pwm = inputString.substring(commaIndex + 1).toInt();
-      }
-      inputString = "";
-    } else {
-      inputString += inChar;
-    }
-  }
-
-  // 타임아웃: 자동 PWM을 기본값으로 복귀
-  if (millis() - lastSerialTime > serialTimeout) {
-    auto_straight_pwm = 1500;
-    auto_direct_pwm = 1500;
-  }
-}
-
-// --- 주행 상태 기반 LED 패턴 출력
-void updateLEDs() {
-  static unsigned long ledTimer = 0;
-  static bool ledOn = false;
-
-  switch (drive_state) {
-    case 3: // 전진
-      digitalWrite(LEFT_LED_PIN, LOW);
-      digitalWrite(RIGHT_LED_PIN, LOW);
-      break;
-
-    case 1: // 좌회전: 왼쪽 점멸
-      if (millis() - ledTimer >= 200) {
-        ledOn = !ledOn;
-        ledTimer = millis();
-      }
-      digitalWrite(LEFT_LED_PIN, ledOn ? HIGH : LOW);
-      digitalWrite(RIGHT_LED_PIN, LOW);
-      break;
-
-    case 2: // 우회전: 오른쪽 점멸
-      if (millis() - ledTimer >= 200) {
-        ledOn = !ledOn;
-        ledTimer = millis();
-      }
-      digitalWrite(LEFT_LED_PIN, LOW);
-      digitalWrite(RIGHT_LED_PIN, ledOn ? HIGH : LOW);
-      break;
-
-    case 0: // 후진: 양쪽 항상 켜기
-      digitalWrite(LEFT_LED_PIN, HIGH);
-      digitalWrite(RIGHT_LED_PIN, HIGH);
-      break;
-
-    default:
-      digitalWrite(LEFT_LED_PIN, LOW);
-      digitalWrite(RIGHT_LED_PIN, LOW);
-      break;
-  }
-}
-
-// --- 메인 루프
-void loop() {
-  static unsigned long lastControlMicros = 0;
-  unsigned long now = micros();
-
-  processSerialInput(); // UART 수신 처리
-
-  if (bNewRC9Pulse) bNewRC9Pulse = false; // 자동/수동 상태 갱신
-
-  if (now - lastControlMicros >= 20000) { // 20ms 주기
-    straight_Control();
-    direct_Control();
-    lastControlMicros = now;
-
-    // 현재 주행 상태 파악
-    int straight_val = (nRC9PulseWidth >= 1500) ? auto_straight_pwm : nRC2PulseWidth;
-    int direct_val   = (nRC9PulseWidth >= 1500) ? auto_direct_pwm   : nRC1PulseWidth;
-
-    if (straight_val < PWM_MID - PWM_DEADZONE)
-      drive_state = 0; // 후진
-    else if (direct_val < PWM_MID - LR_SEPARATION)
-      drive_state = 1; // 좌회전
-    else if (direct_val > PWM_MID + LR_SEPARATION)
-      drive_state = 2; // 우회전
-    else if (straight_val > PWM_MID + PWM_DEADZONE)
-      drive_state = 3; // 전진
-    else
-      drive_state = 3; // 기본 전진
-
-    updateLEDs(); // 방향지시등 상태 갱신
-  }
-}
+// 예: 자동 모드 조건문
+int selected_pwm = (nRC9PulseWidth >= 1500) ? auto_straight_pwm : nRC2PulseWidth;
 ```
+- 모든 PWM 출력은 Servo 라이브러리를 통해 마이크로초 단위로 제어됨 (writeMicroseconds())
+
+
+---
+
+-------------------------------------------------------------------------------------------
 
 ## 소스 동작원리 - RaspberryPi_lineDetection
 이 파이썬 코드는 Raspberry Pi에서 실행되며, **PiCamera2로부터 실시간 영상 프레임을 받아 차선을 검출하고**, 해당 정보를 기반으로 **PID 제어를 수행**한 뒤, **PWM 제어값을 아두이노에 시리얼로 전송**합니다.  
 또한, 실시간 주행 상황을 외부에서 확인할 수 있도록 **WebSocket 서버를 통해 JPEG 영상 스트림을 송신**합니다.
 
-### 🔧 전체 구조 요약
+### 전체 구조 요약
 
 | 기능 | 설명 |
 |------|------|
