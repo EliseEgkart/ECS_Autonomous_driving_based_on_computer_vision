@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Line Tracing (WebSocket)</title>
+  <style>
+    body { font-family: sans-serif; }
+  </style>
+</head>
+<body>
+  <h2>Live Stream</h2>
+  <img id="video" width="320" height="240">
+
+  <script>
+    const ws = new WebSocket("ws://192.168.4.199:8765");
+
+    ws.onmessage = function(event) {
+      const img = document.getElementById("video");
+      img.src = "data:image/jpeg;base64," + event.data;
+    };
+  </script>
+</body>
+</html>
