@@ -6,7 +6,7 @@
 | **김수민** | 아두이노 : RC 신호 해석, 서보모터 · ESC 제어 로직, 통신 프로토콜 구현|
 | **김형진** | 라즈베리파이 : 영상 처리, 라인검출 기반 조향 제어, 웹 스트리밍, 통신 프로토콜 구현 |
 
-* 해당 Repository는 자율동작만 수행하는소스코드, 자동+수동 동작을 수행하는 코드를 하나로 간주하여 설명합니다.
+* 해당 Repository는 자율동작만 수행하는 소스코드, 자동+수동 동작을 수행하는 코드를 하나로 간주하여 설명합니다.
 * 또한 `RaspberryPi_lineDetection/index.html` 내의  
   `new WebSocket("ws://---.---.---.---:8765");` 부분을 본인의 환경에 맞게 설정 후 로컬 웹서버로 실행합니다.
 
@@ -71,11 +71,13 @@ else
 
 #### 3. PWM 해석 및 제어
 - 데드존 ±20 µs 내에서는 정지
-- 전진/후진 기준값은 PWM_STRAIGHT_FRONT, PWM_STRAIGHT_BACK
-- PWM_VARIATION만큼 조정
+- **직진 제어** : PWM_STRAIGHT_FRONT + PWM_VARIATION
+- **후진 제어** : PWM_STRAIGHT_BACK - PWM_VARIATION
 ```cpp
 if (selected_pwm > PWM_MID + DEADZONE)
     straight_pwm = PWM_STRAIGHT_FRONT + PWM_VARIATION;
+else if(selected_pwm <= PWM_MID - PWM_DEADZONE)
+    straight_pwm = PWM_STRAIGHT_BACK - PWM_VARIATION;
 ```
 - 조향은 그대로 서보에 전달 (다만 보정값 -157 적용)
 ```cpp
@@ -288,10 +290,10 @@ async with websockets.serve(...):
 | `speed` | ESC(전·후진) PWM 값 (µs)  | `1525`, `1460` |
 | `steer` | 서보(조향) PWM 값 (µs)   | `1492`, `1800` |
 | 구분자   | 쉼표 **`,`**              |              |
-| 종료     | 개행 **`\\n`**            |              |
+| 종료     | 개행 **`\n`**            |              |
 
 - **전송 주기** : Raspberry Pi가 30 ms 주기로 문자열 전송  
-- **패킷 구성** : `"speed,steer\\n"` 형태의 ASCII 문자열  
+- **패킷 구성** : `"speed,steer\n"` 형태의 ASCII 문자열  
 - **Fail-safe** : 500 ms 이상 무신호 시 Arduino가 PWM을 1500 µs로 복귀
 
 
